@@ -1,0 +1,271 @@
+name: Web2APK Build
+
+# Dipicu oleh buildbot/queue.js melalui:
+#   triggerWeb2ApkWorkflow(job.webUrl, job.appName, iconUrl)
+# di menu/build.js baris ~1225. Perhatikan: JS-nya TIDAK mengirim "tag" ke
+# workflow ini (tag cuma dipakai lokal buat penamaan release icon) — jadi
+# run_id hasil dispatch harus dikorelasikan sendiri oleh buildbot/github.js
+# (biasanya dengan list workflow runs abis dispatch & ambil yang terbaru).
+#
+# Kontrak input HARUS sama persis dengan nama key yang dikirim di body
+# `{ ref, inputs: {...} }` pada saat POST ke
+# /repos/{owner}/{repo}/actions/workflows/web2apk.yml/dispatches.
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: "URL website yang mau dibungkus jadi APK"
+        required: true
+        type: string
+      app_name:
+        description: "Nama aplikasi (jadi label & nama project)"
+        required: true
+        type: string
+      icon_url:
+        description: "Download URL icon app (release asset icon.png)"
+        required: true
+        type: string
+
+concurrency:
+  group: web2apk-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Web2APK — ${{ inputs.app_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # ─── Bikin nama project Dart yang valid dari app_name bebas ────────────
+      - name: Sanitize project name
+        id: sanitize
+        run: |
+          set -e
+          python3 - <<'PYEOF' >> "$GITHUB_OUTPUT"
+          import re, os
+          app_name = os.environ["APP_NAME"]
+          slug = re.sub(r"[^a-z0-9_]", "_", app_name.lower())
+          slug = re.sub(r"_+", "_", slug).strip("_")
+          if not slug or not slug[0].isalpha():
+              slug = "app_" + slug
+          print(f"project_slug={slug}")
+          PYEOF
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+
+      - name: Create Flutter WebView project
+        run: |
+          set -e
+          flutter create \
+            --org com.naeribuild \
+            --project-name ${{ steps.sanitize.outputs.project_slug }} \
+            --platforms android \
+            webapp
+
+      - name: Add webview_flutter dependency
+        working-directory: webapp
+        run: flutter pub add webview_flutter
+
+      # ─── Ganti main.dart dengan WebView yang nge-load web_url ──────────────
+      - name: Write WebView main.dart
+        working-directory: webapp
+        run: |
+          cat > lib/main.dart <<'DARTEOF'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() {
+            runApp(const MyApp());
+          }
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                home: const WebViewPage(),
+              );
+            }
+          }
+
+          class WebViewPage extends StatefulWidget {
+            const WebViewPage({super.key});
+
+            @override
+            State<WebViewPage> createState() => _WebViewPageState();
+          }
+
+          class _WebViewPageState extends State<WebViewPage> {
+            late final WebViewController _controller;
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setBackgroundColor(const Color(0x00000000))
+                ..loadRequest(Uri.parse('__WEB2APK_URL_PLACEHOLDER__'));
+            }
+
+            Future<bool> _onWillPop() async {
+              if (await _controller.canGoBack()) {
+                await _controller.goBack();
+                return false;
+              }
+              return true;
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: SafeArea(
+                  child: PopScope(
+                    canPop: false,
+                    onPopInvokedWithResult: (didPop, result) async {
+                      if (didPop) return;
+                      if (await _onWillPop() && context.mounted) {
+                        Navigator.of(context).maybePop();
+                      }
+                    },
+                    child: WebViewWidget(controller: _controller),
+                  ),
+                ),
+              );
+            }
+          }
+          DARTEOF
+
+          python3 - <<'PYEOF'
+          import os
+          url = os.environ["WEB_URL"]
+          with open("lib/main.dart", "r", encoding="utf-8") as f:
+              content = f.read()
+          content = content.replace("__WEB2APK_URL_PLACEHOLDER__", url)
+          with open("lib/main.dart", "w", encoding="utf-8") as f:
+              f.write(content)
+          PYEOF
+        env:
+          WEB_URL: ${{ inputs.web_url }}
+
+      # ─── Tambah izin INTERNET (gak ada di template default) ────────────────
+      - name: Add INTERNET permission
+        working-directory: webapp
+        run: |
+          python3 - <<'PYEOF'
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+          permission = '<uses-permission android:name="android.permission.INTERNET"/>\n    '
+          if "android.permission.INTERNET" not in content:
+              # Sisipkan tepat sebelum tag <application ...>
+              idx = content.find("<application")
+              content = content[:idx] + permission + content[idx:]
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+          PYEOF
+
+      # ─── Set nama app (android:label) sesuai app_name, escape XML ──────────
+      - name: Set app label
+        working-directory: webapp
+        run: |
+          python3 - <<'PYEOF'
+          import os, re
+          from xml.sax.saxutils import escape
+
+          app_name = os.environ["APP_NAME"]
+          escaped = escape(app_name)
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+          content = re.sub(r'android:label="[^"]*"', f'android:label="{escaped}"', content, count=1)
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+          PYEOF
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+
+      # ─── Unduh icon dari release & generate semua ukuran mipmap ────────────
+      # Ukuran sama persis dengan buildbot/iconFix.js DENSITY_SIZES supaya
+      # konsisten dengan sistem auto-fix icon yang sudah ada di bot.
+      - name: Download and install app icon
+        run: |
+          set -e
+          HTTP_CODE=$(curl -sL -w "%{http_code}" -o icon_source.png \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "${{ inputs.icon_url }}")
+
+          if [ "$HTTP_CODE" != "200" ] || [ ! -s icon_source.png ]; then
+            echo "::error::Gagal download icon_url (HTTP $HTTP_CODE) atau file kosong."
+            exit 1
+          fi
+
+          sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
+
+          declare -A DENSITY_SIZES=(
+            [mipmap-ldpi]=36
+            [mipmap-mdpi]=48
+            [mipmap-hdpi]=72
+            [mipmap-xhdpi]=96
+            [mipmap-xxhdpi]=144
+            [mipmap-xxxhdpi]=192
+          )
+
+          for folder in "${!DENSITY_SIZES[@]}"; do
+            size="${DENSITY_SIZES[$folder]}"
+            dest="webapp/android/app/src/main/res/$folder"
+            mkdir -p "$dest"
+            convert icon_source.png -resize "${size}x${size}" -gravity center -extent "${size}x${size}" "$dest/ic_launcher.png"
+            echo "Generated $dest/ic_launcher.png (${size}x${size})"
+          done
+
+      - name: Flutter pub get
+        working-directory: webapp
+        run: flutter pub get
+
+      - name: Flutter build apk (release)
+        working-directory: webapp
+        run: flutter build apk --release
+
+      # ─── Kumpulkan hasil APK ────────────────────────────────────────────────
+      - name: Collect APK output
+        run: |
+          set -e
+          OUT_DIR="webapp/build/app/outputs/flutter-apk"
+          APK_PATH=$(find "$OUT_DIR" -maxdepth 1 -name "*.apk" | head -n1)
+
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::Gak ada file .apk hasil build ditemukan di $OUT_DIR"
+            exit 1
+          fi
+
+          mkdir -p artifact-output
+          FINAL_NAME="web2apk-${{ steps.sanitize.outputs.project_slug }}-${{ github.run_id }}.apk"
+          cp "$APK_PATH" "artifact-output/$FINAL_NAME"
+          echo "APK siap: $FINAL_NAME ($(du -h "artifact-output/$FINAL_NAME" | cut -f1))"
+
+      # Nama artifact SENGAJA mengandung kata "apk"/"build" karena
+      # menu/build.js mencocokkan artifact lewat:
+      #   a.name.toLowerCase().includes("apk") || a.name.toLowerCase().includes("build")
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-build-web2apk-${{ github.run_id }}
+          path: artifact-output/*.apk
+          retention-days: 1
+          if-no-files-found: error
