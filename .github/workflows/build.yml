@@ -27,13 +27,6 @@ on:
           - release
         default: release
 
-# Declare eksplisit — jangan andalkan default repo/org setting.
-# Tanpa ini, kalau default workflow permission repo/org ke-set ke
-# "restricted"/none, secrets.GITHUB_TOKEN gak bisa baca release asset
-# sama sekali dan step "Download source zip" bakal 403.
-permissions:
-  contents: read
-
 concurrency:
   group: build-${{ github.event.inputs.tag }}
   cancel-in-progress: false
@@ -66,6 +59,16 @@ jobs:
       # ─── Ekstrak & cari root folder project Flutter yang sebenarnya ───────
       # ZIP yang di-upload user kadang punya 1 folder pembungkus di root,
       # kadang enggak. Kita cari folder yang punya pubspec.yaml.
+      #
+      # FIX: sebelumnya pakai `find ... | head -n1 | xargs -r dirname`.
+      # Kalau di dalam ZIP ada LEBIH DARI SATU pubspec.yaml (mis. project
+      # utama + folder contoh/plugin/dependency bawaan yang ikut ke-zip),
+      # kombinasi itu bisa menghasilkan PROJECT_DIR multi-baris (contoh
+      # nyata: "project" + "mercy" pada baris terpisah). Baris kedua yang
+      # nyasar itu lalu ikut ditulis ke $GITHUB_OUTPUT dan bikin step gagal
+      # dengan "Invalid format" karena bukan format key=value.
+      # `-print -quit` bikin find BERHENTI TOTAL begitu match pertama
+      # ditemukan, jadi hasilnya dijamin cuma satu baris, apa pun isi ZIP-nya.
       - name: Extract project
         id: extract
         run: |
@@ -73,7 +76,7 @@ jobs:
           mkdir -p project
           unzip -q source.zip -d project
 
-          PROJECT_DIR=$(find project -maxdepth 4 -name "pubspec.yaml" -not -path "*/build/*" | head -n1 | xargs -r dirname)
+          PROJECT_DIR=$(find project -maxdepth 4 -name "pubspec.yaml" -not -path "*/build/*" -print -quit | xargs -r dirname)
 
           if [ -z "$PROJECT_DIR" ]; then
             echo "::error::pubspec.yaml gak ketemu di dalam ZIP. Pastikan ini project Flutter yang valid."
@@ -110,12 +113,15 @@ jobs:
           fi
 
       # ─── Kumpulkan hasil APK ────────────────────────────────────────────────
+      # FIX defensif: pola `find | head -n1` yang sama seperti di step
+      # "Extract project" diganti `-print -quit`, supaya tetap aman kalau
+      # nanti folder output APK berisi lebih dari satu file .apk.
       - name: Collect APK output
         id: collect
         run: |
           set -e
           OUT_DIR="${{ steps.extract.outputs.project_dir }}/build/app/outputs/flutter-apk"
-          APK_PATH=$(find "$OUT_DIR" -maxdepth 1 -name "*.apk" | head -n1)
+          APK_PATH=$(find "$OUT_DIR" -maxdepth 1 -name "*.apk" -print -quit)
 
           if [ -z "$APK_PATH" ]; then
             echo "::error::Gak ada file .apk hasil build ditemukan di $OUT_DIR"
